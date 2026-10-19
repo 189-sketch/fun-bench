@@ -42,6 +42,7 @@ export interface Entry {
   id: string;
   taskId: string;
   status: 'pending' | 'queued' | 'running' | 'done' | 'failed';
+  attempts?: number;
   content?: string;
   html?: string | null;
   truncated?: boolean;

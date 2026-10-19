@@ -5,10 +5,22 @@ import { join } from 'node:path';
 import { createApp } from '../server/app.mjs';
 import { createStore } from '../server/store.mjs';
 
+const flakyAttempts = new Map();
 const mock = createServer(async (req, res) => {
   let text = '';
   for await (const part of req) text += part;
   const body = JSON.parse(text);
+  // A flaky model drops the first attempt and answers the retry, so the browser
+  // test can cover a contestant starting over.
+  if (body.model.includes('flaky')) {
+    const attempts = (flakyAttempts.get(body.model) || 0) + 1;
+    flakyAttempts.set(body.model, attempts);
+    if (attempts === 1) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: '临时故障，请稍后重试' } }));
+      return;
+    }
+  }
   if (body.model.includes('slow')) {
     if (!body.stream) {
       await new Promise((resolve) => setTimeout(resolve, 350));

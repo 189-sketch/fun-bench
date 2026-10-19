@@ -187,6 +187,7 @@ export function createApp(store) {
             id: e.id,
             taskId: e.taskId,
             status: e.status,
+            attempts: e.attempts ?? 1,
             content: e.status === 'done' ? e.content : undefined,
             html:
               e.status === 'done' && bench.tasks.find((t) => t.id === e.taskId).format === 'html'
@@ -202,6 +203,17 @@ export function createApp(store) {
       results: ballot ? totals(bench, ballots(bench)) : undefined,
       voterCount: ballot ? ballots(bench).length : undefined,
     };
+  }
+  // 让掉线的选手重新开始：清掉上一次的失败，重新排队生成这一份成果。
+  // 其它题目、其它选手和已经给出的评分都不受影响。
+  function restart(bench, entry) {
+    entry.status = 'queued';
+    entry.attempts = (entry.attempts ?? 1) + 1;
+    delete entry.error;
+    delete entry.outputChars;
+    delete entry.content;
+    delete entry.duration;
+    delete entry.truncated;
   }
   function queue(benchId, entryId) {
     pending.push(async () => {
@@ -372,6 +384,7 @@ export function createApp(store) {
         taskId: task.id,
         modelId: m.id,
         status: ti === 0 ? 'queued' : 'pending',
+        attempts: 1,
       })),
     );
     persistBench(bench);
@@ -420,6 +433,7 @@ export function createApp(store) {
         taskId: task.id,
         modelId: models[i].id,
         status: 'done',
+        attempts: 1,
         content: e.content,
         duration: 0,
       })),
@@ -427,22 +441,36 @@ export function createApp(store) {
     persistBench(bench);
     res.status(201).json({ id: bench.id });
   });
+  // 让掉线的选手重新开始：只重跑这一份成果，评测其它部分保持原样。
+  app.post('/api/benches/:id/entries/:entryId/retry', (req, res) => {
+    const bench = access(req, req.params.id, false);
+    if (!bench) return res.status(404).json({ error: '找不到评测' });
+    if (ballots(bench).length)
+      return res.status(409).json({ error: '本场评测已揭晓，不能重新开始' });
+    const entry = bench.entries.find((e) => e.id === req.params.entryId);
+    if (!entry) return res.status(404).json({ error: '找不到这位选手的成果' });
+    if (entry.status !== 'failed') return res.status(409).json({ error: '这位选手已经在作答中' });
+    restart(bench, entry);
+    // 还有人在作答时，评测就还没有结束，提交评分的入口保持关闭。
+    if (bench.status === 'done') bench.status = 'running';
+    persistBench(bench);
+    log('entry.restarted', { benchId: bench.id, entryId: entry.id, taskId: entry.taskId });
+    res.json(view(req, bench));
+    queue(bench.id, entry.id);
+  });
   app.post('/api/benches/:id/retry', (req, res) => {
     const bench = access(req, req.params.id, false);
     if (!bench) return res.status(404).json({ error: '找不到评测' });
-    if (bench.status === 'running' || ballots(bench).length)
-      return res.status(409).json({ error: '测试进行中或已有评分，无法重试；请新建一场评测' });
+    if (ballots(bench).length)
+      return res.status(409).json({ error: '本场评测已揭晓，不能重新开始' });
     const failed = bench.entries.filter((e) => e.status === 'failed');
     if (!failed.length) return res.status(400).json({ error: '没有需要重试的成果' });
-    failed.forEach((e) => {
-      e.status = 'queued';
-      delete e.error;
-      delete e.outputChars;
-    });
-    bench.status = 'running';
+    failed.forEach((entry) => restart(bench, entry));
+    if (bench.status === 'done') bench.status = 'running';
     persistBench(bench);
-    res.json({ ok: true });
-    failed.forEach((e) => queue(bench.id, e.id));
+    log('entries.restarted', { benchId: bench.id, count: failed.length });
+    res.json(view(req, bench));
+    failed.forEach((entry) => queue(bench.id, entry.id));
   });
   app.post('/api/benches/:id/share', (req, res) => {
     const bench = access(req, req.params.id, false);

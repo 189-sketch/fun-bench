@@ -2415,6 +2415,13 @@ nav > button.active:after {
 .entry-placeholder.failed h3 {
   color: #b08c59;
 }
+.entry-placeholder .entry-hint {
+  max-width: 250px;
+  font-size: 10px;
+  line-height: 1.8;
+  color: #b08c59;
+  opacity: 0.9;
+}
 .thinking-character {
   height: 75px;
   width: 70px;

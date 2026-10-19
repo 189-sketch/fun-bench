@@ -74,6 +74,8 @@ export default function Review({
   const [shareUrl, setShareUrl] = useState('');
   const [shareBusy, setShareBusy] = useState(false);
   const [celebrate, setCelebrate] = useState(0);
+  // 正在重新开始的选手，避免重复点击重复提交。
+  const [restartingId, setRestartingId] = useState('');
   const cardsRef = useRef<HTMLDivElement>(null);
   const activeRequest = useRef(false);
   // 轮询与揭晓、投票的响应可能乱序，用版本号丢弃过期响应。
@@ -152,6 +154,8 @@ export default function Review({
   const rated = doneEntries.filter((e) => scores[e.id] !== undefined).length;
   const canSubmit = bench.status === 'done' && totalRatings > 0 && rated === totalRatings;
   const failed = bench.entries.filter((e) => e.status === 'failed').length;
+  // 只有创建者能让掉线的选手重新开始：重新生成用的是创建者的 Key 和费用。
+  const canRestart = bench.owner && !bench.revealed;
   const activeEntries = bench.entries.filter((e) => e.taskId === activeTask.id);
   const activeDone = activeEntries.filter((e) => e.status === 'done');
   const activeSettled = activeEntries.filter((e) => ['done', 'failed'].includes(e.status)).length;
@@ -186,7 +190,7 @@ export default function Review({
     : !viewSettled
       ? '选手们还没有作答完成'
       : viewFailed.length
-        ? `有 ${viewFailed.length} 份成果未生成成功`
+        ? `有 ${viewFailed.length} 份成果未生成成功${canRestart ? '，可让他们重新开始' : ''}`
         : !viewScored
           ? '先给本题的成果打分，再揭晓'
           : '揭晓后本题评分将锁定';
@@ -282,12 +286,31 @@ export default function Review({
   async function retry() {
     setBusy(true);
     try {
-      await api(`/benches/${bench!.id}/retry`, {});
-      await load();
+      version.current += 1;
+      const data = await api<Bench>(`/benches/${bench!.id}/retry`, {});
+      version.current += 1;
+      setBench(data);
+      notify('掉线的选手正在重新开始');
     } catch (e) {
       notify(reportError(e));
     } finally {
       setBusy(false);
+    }
+  }
+  // 让掉线的选手重新开始：只重跑这一份成果，其它题目和评分都不受影响。
+  async function retryEntry(entryId: string) {
+    if (restartingId) return;
+    setRestartingId(entryId);
+    try {
+      version.current += 1;
+      const data = await api<Bench>(`/benches/${bench!.id}/entries/${entryId}/retry`, {});
+      version.current += 1;
+      setBench(data);
+      notify('这位选手正在重新开始');
+    } catch (e) {
+      notify(reportError(e));
+    } finally {
+      setRestartingId('');
     }
   }
   return (
@@ -368,17 +391,21 @@ export default function Review({
           </div>
         </div>
       )}
-      {failed > 0 && bench.status === 'done' && (
+      {failed > 0 && (
         <div className="failure-banner">
           <Flag size={19} />
           <p>
             {failed} 份成果未生成成功，不计入评分。
-            {bench.revealed ? '本轮结果仅包含成功的成果。' : '你可以先处理失败，或评价已有成果。'}
+            {bench.revealed
+              ? '本轮结果仅包含成功的成果。'
+              : bench.owner
+                ? '掉线的选手可以重新开始，其它成果照常评分。'
+                : '创建者可以让掉线的选手重新开始。'}
           </p>
-          {bench.owner && !bench.revealed && (
+          {canRestart && (
             <button className="button secondary small" disabled={busy} onClick={retry}>
               <RotateCcw size={14} />
-              重试失败项
+              全部重新开始
             </button>
           )}
         </div>
@@ -474,6 +501,9 @@ export default function Review({
             voterCount={bench.voterCount}
             value={scores[entry.id]}
             setScore={(value) => setScore(entry.id, value)}
+            canRestart={canRestart}
+            restarting={restartingId === entry.id}
+            onRetry={retryEntry}
           />
         ))}
       </div>
@@ -700,6 +730,9 @@ function EntryCard({
   voterCount,
   value,
   setScore,
+  canRestart,
+  restarting,
+  onRetry,
 }: {
   entry: Entry;
   index: number;
@@ -712,6 +745,9 @@ function EntryCard({
   voterCount?: number;
   value: number | undefined;
   setScore: (value: number | undefined) => void;
+  canRestart: boolean;
+  restarting: boolean;
+  onRetry: (entryId: string) => void;
 }) {
   const [tab, setTab] = useState<'preview' | 'raw'>('preview');
   const [reset, setReset] = useState(0);
@@ -727,6 +763,8 @@ function EntryCard({
     return () => clearTimeout(timer);
   }, [playing, index]);
   const letter = String.fromCharCode(65 + index);
+  // 掉线后重新开始的选手，用不同的文案说明 TA 正在第二次作答。
+  const restarted = (entry.attempts ?? 1) > 1;
   const complete = value !== undefined;
   const html = entry.html ? secureHtml(entry.html) : '';
   function download() {
@@ -890,6 +928,19 @@ function EntryCard({
               <h3>这位选手暂时掉线了</h3>
               <p>{entry.error}</p>
               <Badge>不计入评分</Badge>
+              {canRestart && (
+                <>
+                  <button
+                    className="button secondary small"
+                    disabled={restarting}
+                    onClick={() => onRetry(entry.id)}
+                  >
+                    <RotateCcw size={14} />
+                    {restarting ? '正在重新开始…' : '重新开始'}
+                  </button>
+                  <small className="entry-hint">重新开始会重新生成这一份成果，成功后即可评分</small>
+                </>
+              )}
             </>
           ) : (
             <>
@@ -897,11 +948,21 @@ function EntryCard({
                 <div />
                 <div />
               </div>
-              <h3>{entry.status === 'queued' ? '正在候场…' : '正在认真作答…'}</h3>
+              <h3>
+                {entry.status === 'queued'
+                  ? restarted
+                    ? '正在重新候场…'
+                    : '正在候场…'
+                  : restarted
+                    ? '正在重新作答…'
+                    : '正在认真作答…'}
+              </h3>
               <p>
                 {entry.outputChars
                   ? `已收到 ${entry.outputChars.toLocaleString()} 字符，仍在生成…`
-                  : '先藏好名字，再交出答案。复杂任务可能需要较长时间，最多等待 30 分钟。'}
+                  : restarted
+                    ? '上一次掉线了，这次重新来过。'
+                    : '先藏好名字，再交出答案。复杂任务可能需要较长时间，最多等待 30 分钟。'}
               </p>
               <LoaderCircle size={19} className="spin" />
             </>

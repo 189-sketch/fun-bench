@@ -341,3 +341,145 @@ test('per-task reveal: one question can be revealed on its own, locks its scores
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('a dropped contestant can start over on its own, without touching the rest of the bench', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'fun-bench-restart-'));
+  const attempts = new Map();
+  const upstream = createServer(async (req, res) => {
+    let text = '';
+    for await (const chunk of req) text += chunk;
+    const body = JSON.parse(text);
+    const count = (attempts.get(body.model) || 0) + 1;
+    attempts.set(body.model, count);
+    res.setHeader('Content-Type', 'application/json');
+    // 掉线的选手第一次没有答上来，重新开始之后正常作答。
+    if (body.model === 'flaky' && count === 1) {
+      res.writeHead(502);
+      res.end(JSON.stringify({ error: { message: '临时故障' } }));
+      return;
+    }
+    res.end(
+      JSON.stringify({
+        choices: [{ message: { content: '这是一份匿名成果。' }, finish_reason: 'stop' }],
+      }),
+    );
+  });
+  const upstreamUrl = await listen(upstream);
+  let store = createStore(directory);
+  let server = createServer(createApp(store));
+  let base = await listen(server);
+  let ownerCookie = '';
+  let guestCookie = '';
+  async function request(path, body, guest = false) {
+    const res = await fetch(`${base}/api${path}`, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: guest ? guestCookie : ownerCookie },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const cookie = res.headers.get('set-cookie')?.split(';')[0];
+    if (cookie) {
+      if (guest) guestCookie = cookie;
+      else ownerCookie = cookie;
+    }
+    return { status: res.status, data: await res.json() };
+  }
+  async function waitFor(predicate, label) {
+    for (let i = 0; i < 200; i++) {
+      const view = (await request(`/benches/${benchId}`)).data;
+      if (predicate(view)) return view;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error(`${label}未在预期时间内发生`);
+  }
+  let benchId = '';
+  try {
+    const modelIds = [];
+    for (const name of ['flaky', 'steady']) {
+      const created = await request('/models', {
+        name,
+        protocol: 'openai',
+        baseUrl: `${upstreamUrl}/v1`,
+        model: name,
+        key: 'restart-secret',
+      });
+      modelIds.push(created.data.id);
+    }
+    const task = {
+      title: '真实任务',
+      prompt: '完成一件真实的事',
+      evaluation: '看是否有用',
+      format: 'text',
+      criteria: [{ name: '帮助程度', maxScore: 100 }],
+    };
+    const created = await request('/benches', {
+      title: '掉线重启',
+      tasks: [task, { ...task, title: '第二题' }],
+      modelIds,
+    });
+    benchId = created.data.id;
+    // 第一题里掉线的选手保持 failed，其它选手正常完成。
+    const view = await waitFor(
+      (v) =>
+        v.entries
+          .filter((e) => e.taskId === v.tasks[0].id)
+          .every((e) => ['done', 'failed'].includes(e.status)),
+      '第一题作答',
+    );
+    const first = view.tasks[0];
+    const dropped = view.entries.find((e) => e.taskId === first.id && e.status === 'failed');
+    const healthy = view.entries.find((e) => e.taskId === first.id && e.status === 'done');
+    assert.ok(dropped, '掉线的成果应当保持 failed');
+    assert.equal(dropped.attempts, 1);
+    assert.ok(healthy);
+    // 访客不能替创建者重新开始：重新生成用的是创建者的 Key。
+    const share = await request(`/benches/${benchId}/share`, {});
+    const token = share.data.path.split('/').at(-1);
+    const guestView = (await request(`/reviews/${token}`, undefined, true)).data;
+    assert.ok(
+      guestView.entries.some((e) => e.id === dropped.id && e.status === 'failed'),
+      '访客看到同样的掉线状态',
+    );
+    assert.equal(
+      (await request(`/benches/${benchId}/entries/${dropped.id}/retry`, {}, true)).status,
+      404,
+    );
+    // 已经在作答的成果不能重新开始。
+    assert.equal(
+      (await request(`/benches/${benchId}/entries/${healthy.id}/retry`, {})).status,
+      409,
+    );
+    // 重新开始：只重跑这一份成果。
+    const restarted = await request(`/benches/${benchId}/entries/${dropped.id}/retry`, {});
+    assert.equal(restarted.status, 200);
+    const restartedEntry = restarted.data.entries.find((e) => e.id === dropped.id);
+    assert.equal(restartedEntry.attempts, 2);
+    assert.ok(['queued', 'running'].includes(restartedEntry.status));
+    assert.equal(restartedEntry.error, undefined, '上一次的错误应当被清掉');
+    assert.equal(healthy.status, 'done');
+    // 重新作答之后，这份成果进入正常流程，可以评分和揭晓。
+    const settled = await waitFor(
+      (v) => v.entries.find((e) => e.id === dropped.id)?.status === 'done',
+      '重新作答',
+    );
+    const scores = Object.fromEntries(
+      settled.entries
+        .filter((e) => e.taskId === first.id && e.status === 'done')
+        .map((e) => [e.id, 70]),
+    );
+    const revealed = await request(`/benches/${benchId}/reveal`, { taskId: first.id, scores });
+    assert.equal(revealed.status, 200, '掉线的选手重新作答后，这一题可以揭晓');
+    assert.deepEqual(revealed.data.revealedTasks, [first.id]);
+    // 全部揭晓之后不能再重新开始。
+    assert.equal(
+      (await request(`/benches/${benchId}/entries/${dropped.id}/retry`, {})).status,
+      409,
+    );
+  } finally {
+    await close(server);
+    await close(upstream);
+    store.close();
+    assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
+    assert.ok(basename(directory).startsWith('fun-bench-restart-'));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

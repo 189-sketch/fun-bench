@@ -218,6 +218,53 @@ test('multiple tasks require complete scores and upstream failures remain anonym
   await expect(page.getByRole('heading', { name: 'mock-openai', exact: true })).toBeVisible();
 });
 
+test('a dropped contestant can start over from its card and rejoin the comparison', async ({
+  page,
+}) => {
+  const request = page.context().request;
+  // Establish the session deterministically before the app fires its own requests.
+  await request.get('/api/health');
+  await page.goto('/');
+  const models = [];
+  // A unique name keeps the mock upstream failing on the first attempt only.
+  for (const model of ['mock-openai', `mock-flaky-${Date.now()}`]) {
+    const response = await request.post('/api/models', {
+      data: {
+        name: model,
+        protocol: 'openai',
+        baseUrl: 'http://127.0.0.1:4174/v1',
+        model,
+        key: 'restart-e2e-secret',
+      },
+    });
+    models.push((await response.json()).id);
+  }
+  const task = {
+    prompt: '对这份访谈做摘要。',
+    evaluation: '是否准确',
+    format: 'text',
+    criteria: [{ name: '准确性', maxScore: 10, description: '结论有证据' }],
+  };
+  const response = await request.post('/api/benches', {
+    data: { title: '掉线重启', modelIds: models, tasks: [{ ...task, title: '题目一' }] },
+  });
+  const { id } = await response.json();
+  await page.goto(`/bench/${id}`);
+  const dropped = page.locator('.entry-card').filter({ hasText: '这位选手暂时掉线了' });
+  await expect(dropped).toBeVisible();
+  await expect(page.getByText('上游服务暂时不可用', { exact: false })).toBeVisible();
+  // 少了一份成果，这一题还不能揭晓
+  await expect(page.getByRole('button', { name: '立即揭晓第 1 题' })).toBeDisabled();
+  await dropped.getByRole('button', { name: '重新开始' }).click();
+  await expect(page.getByText(/正在重新(候场|作答)/)).toBeVisible();
+  // 重新作答成功后回到正常流程，可以评分，也可以揭晓这一题
+  await expect(page.locator('.entry-card .fuzzy-score').first()).toBeVisible({ timeout: 20000 });
+  await scoreAll(page);
+  await expect(page.getByRole('button', { name: '立即揭晓第 1 题' })).toBeEnabled();
+  await page.getByRole('button', { name: '立即揭晓第 1 题' }).click();
+  await expect(page.getByRole('heading', { name: 'mock-openai', exact: true })).toBeVisible();
+});
+
 test('a single question can be revealed on its own, locking only that question', async ({
   page,
 }) => {

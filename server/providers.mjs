@@ -42,6 +42,10 @@ async function httpError(response) {
     return providerError(
       `服务返回 HTTP ${response.status}：触发额度或速率限制，请稍后重试或检查账户余额`,
     );
+  if ([502, 503].includes(response.status))
+    return providerError(
+      `服务返回 HTTP ${response.status}：上游服务暂时不可用，可以让这位选手重新开始`,
+    );
   if ([408, 504].includes(response.status))
     return providerError(`服务返回 HTTP ${response.status}：上游网关等待超时，请稍后重试`);
   return providerError(`服务返回 HTTP ${response.status}，请检查模型配置或额度`);
