@@ -457,8 +457,10 @@ export default function Create({
           <div className="launch-note">
             <ShieldCheck size={19} />
             <p>
-              将发起 {tasks.length * selected.length} 次 API 生成，使用你保存的
-              Key，费用由服务商按实际用量收取。仅发送测试提示词与其中的材料；评分标准供评审使用。当前支持文本生成与单文件网页，不调用外部搜索工具。
+              将按题目依次测试：每题发起 {selected.length} 次 API
+              生成，作答并评分后，点击「继续测试下一个」才发起下一题， 共 {tasks.length} 题、最多{' '}
+              {tasks.length * selected.length} 次生成。使用你保存的
+              Key，费用由服务商按实际用量收取。仅发送测试提示词与其中的材料；评分标准供评审参考。当前支持文本生成与单文件网页，不调用外部搜索工具。
             </p>
           </div>
         </section>
@@ -492,7 +494,7 @@ export default function Create({
           ) : (
             <button className="button primary" disabled={busy || !title.trim()} onClick={start}>
               <Rocket size={17} />
-              {busy ? '正在开场…' : '开始并行测试'}
+              {busy ? '正在开场…' : '开始测试'}
             </button>
           )}
         </div>

@@ -154,7 +154,7 @@ test('end-to-end API: encrypted credentials, parallel protocols, independent bli
     const guestView = (await request(`/reviews/${token}`, undefined, true)).data;
     assert.equal(guestView.revealed, false);
     assert.equal((await request(`/benches/${benchId}/vote`, { scores: {} })).status, 400);
-    const scores = Object.fromEntries(view.entries.map((e) => [e.id, { 0: 80 }]));
+    const scores = Object.fromEntries(view.entries.map((e) => [e.id, 80]));
     const reveal = await request(`/benches/${benchId}/vote`, { scores, comment: '判断已锁定' });
     assert.equal(reveal.status, 200);
     assert.equal(reveal.data.revealed, true);
@@ -165,7 +165,7 @@ test('end-to-end API: encrypted credentials, parallel protocols, independent bli
       false,
       'owner reveal does not reveal guest identity',
     );
-    const guestScores = Object.fromEntries(guestView.entries.map((e) => [e.id, { 0: 100 }]));
+    const guestScores = Object.fromEntries(guestView.entries.map((e) => [e.id, 100]));
     const guestReveal = await request(`/reviews/${token}/vote`, { scores: guestScores }, true);
     assert.equal(guestReveal.data.voterCount, 2);
     assert.equal(guestReveal.data.results[0].average, 90);
@@ -190,6 +190,154 @@ test('end-to-end API: encrypted credentials, parallel protocols, independent bli
     store.close();
     assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
     assert.ok(basename(directory).startsWith('fun-bench-api-'));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('per-task reveal: one question can be revealed on its own, locks its scores and stays private to the reviewer', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'fun-bench-reveal-'));
+  const upstream = createServer(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(
+      JSON.stringify({
+        choices: [{ message: { content: '这是一份匿名成果。' }, finish_reason: 'stop' }],
+      }),
+    );
+  });
+  const upstreamUrl = await listen(upstream);
+  let store = createStore(directory);
+  let server = createServer(createApp(store));
+  let base = await listen(server);
+  let ownerCookie = '';
+  let guestCookie = '';
+  async function request(path, body, guest = false) {
+    const res = await fetch(`${base}/api${path}`, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: guest ? guestCookie : ownerCookie },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const cookie = res.headers.get('set-cookie')?.split(';')[0];
+    if (cookie) {
+      if (guest) guestCookie = cookie;
+      else ownerCookie = cookie;
+    }
+    return { status: res.status, data: await res.json() };
+  }
+  // 等到某道题的所有成果落定。
+  async function settled(view, taskId) {
+    const list = view.entries.filter((e) => e.taskId === taskId);
+    return list.length > 0 && list.every((e) => ['done', 'failed'].includes(e.status));
+  }
+  async function waitFor(taskId) {
+    for (let i = 0; i < 200; i++) {
+      const view = (await request(`/benches/${benchId}`)).data;
+      if (await settled(view, taskId)) return view;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error('生成未在预期时间内结束');
+  }
+  let benchId = '';
+  try {
+    const modelIds = [];
+    for (const name of ['隐藏选手一', '隐藏选手二']) {
+      const created = await request('/models', {
+        name,
+        protocol: 'openai',
+        baseUrl: `${upstreamUrl}/v1`,
+        model: 'mock-openai',
+        key: 'reveal-secret',
+      });
+      modelIds.push(created.data.id);
+    }
+    const task = {
+      title: '真实任务',
+      prompt: '完成一件真实的事',
+      evaluation: '看是否有用',
+      format: 'text',
+      criteria: [{ name: '帮助程度', maxScore: 100 }],
+    };
+    const created = await request('/benches', {
+      title: '单题揭晓',
+      tasks: [task, { ...task, title: '第二题' }],
+      modelIds,
+    });
+    benchId = created.data.id;
+    let view = await waitFor((await request(`/benches/${benchId}`)).data.tasks[0].id);
+    const first = view.tasks[0];
+    const firstEntries = view.entries.filter((e) => e.taskId === first.id);
+    assert.equal(firstEntries.length, 2);
+    assert.ok(firstEntries.every((e) => e.status === 'done'));
+    // 揭晓前必须先给本题打分
+    assert.equal(
+      (await request(`/benches/${benchId}/reveal`, { taskId: first.id, scores: {} })).status,
+      400,
+    );
+    // 别的评测的题目 id 无效
+    assert.equal(
+      (await request(`/benches/${benchId}/reveal`, { taskId: 'foreign-task', scores: { a: 50 } }))
+        .status,
+      400,
+    );
+    // 还没开始的题目不能揭晓
+    assert.equal(
+      (await request(`/benches/${benchId}/reveal`, { taskId: view.tasks[1].id, scores: {} }))
+        .status,
+      409,
+    );
+    const scores = Object.fromEntries(firstEntries.map((e) => [e.id, 60]));
+    const revealed = await request(`/benches/${benchId}/reveal`, { taskId: first.id, scores });
+    assert.equal(revealed.status, 200);
+    assert.equal(revealed.data.revealed, false, '单题揭晓不等于全场揭晓');
+    assert.deepEqual(revealed.data.revealedTasks, [first.id]);
+    const revealedEntries = revealed.data.entries.filter((e) => e.taskId === first.id);
+    assert.ok(revealedEntries.every((e) => e.model?.name));
+    assert.ok(
+      revealedEntries.every((e) => !('baseUrl' in e.model)),
+      '揭晓后不下发 Base URL',
+    );
+    assert.ok(!JSON.stringify(revealed.data).includes(upstreamUrl));
+    assert.deepEqual(revealed.data.lockedScores, scores);
+    // 重复提交保持幂等
+    assert.equal(
+      (await request(`/benches/${benchId}/reveal`, { taskId: first.id, scores })).status,
+      200,
+    );
+    // 其他评审者既看不到身份，也看不到别人的揭晓状态
+    const share = await request(`/benches/${benchId}/share`, {});
+    const token = share.data.path.split('/').at(-1);
+    const guestView = (await request(`/reviews/${token}`, undefined, true)).data;
+    assert.deepEqual(guestView.revealedTasks, []);
+    assert.deepEqual(guestView.lockedScores, {});
+    assert.equal(
+      guestView.entries.filter((e) => e.taskId === first.id).some((e) => e.model),
+      false,
+    );
+    // 进入第二题并完成
+    await request(`/benches/${benchId}/next`, {});
+    view = await waitFor(view.tasks[1].id);
+    const allEntries = view.entries.filter((e) => e.status === 'done');
+    const finalScores = Object.fromEntries(allEntries.map((e) => [e.id, 90]));
+    for (const entry of firstEntries) finalScores[entry.id] = 10;
+    const vote = await request(`/benches/${benchId}/vote`, { scores: finalScores });
+    assert.equal(vote.status, 200);
+    for (const entry of firstEntries)
+      assert.equal(vote.data.myBallot.scores[entry.id], 60, '已揭晓题目的分数以服务端锁定值为准');
+    // 重启后揭晓状态与锁定分数仍在
+    await close(server);
+    store.close();
+    store = createStore(directory);
+    server = createServer(createApp(store));
+    base = await listen(server);
+    const restored = (await request(`/benches/${benchId}`)).data;
+    assert.ok(restored.revealedTasks.includes(first.id));
+    assert.deepEqual(restored.lockedScores, scores);
+  } finally {
+    await close(server);
+    await close(upstream);
+    store.close();
+    assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
+    assert.ok(basename(directory).startsWith('fun-bench-reveal-'));
     rmSync(directory, { recursive: true, force: true });
   }
 });

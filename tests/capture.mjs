@@ -19,9 +19,9 @@ try {
     .getByText('25:00', { exact: true })
     .waitFor();
   await page.screenshot({ path: `${directory}/blind-review.png`, fullPage: true });
-  const fields = page.getByRole('spinbutton', { name: /选手 .* 分数/ });
-  for (let i = 0; i < (await fields.count()); i++)
-    await fields.nth(i).fill(String([35, 28, 26, 30, 25, 25, 32, 26, 22][i]));
+  const cards = page.locator('.entry-card');
+  for (let i = 0; i < (await cards.count()); i++)
+    await cards.nth(i).locator('.fuzzy-score button', { hasText: '可以' }).click();
   await page.getByRole('button', { name: '提交评分，揭晓身份' }).click();
   await page.getByRole('button', { name: '确认评分并揭晓' }).click();
   await page.getByText('身份已揭晓', { exact: true }).waitFor();

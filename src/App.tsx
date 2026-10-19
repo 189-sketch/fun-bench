@@ -162,12 +162,12 @@ export default function App() {
               {
                 icon: Users,
                 title: '02 / 指定模型参赛',
-                text: '回到这里导入题目，选择你配置的模型，以相同题目并行测试。',
+                text: '回到这里导入题目，选择你配置的模型，逐题测试，一题接一题。',
               },
               {
                 icon: Trophy,
                 title: '03 / 打分，然后揭晓',
-                text: '体验匿名成果，按题目的标准打分。提交后，看看谁更懂你的工作。',
+                text: '体验匿名成果，用整体档位打分，点“继续测试下一个”进入下一题。提交后，看看谁更懂你的工作。',
               },
             ].map(({ icon: Icon, title, text }) => (
               <div key={title}>

@@ -1,27 +1,37 @@
 import { z } from 'zod';
 
 const text = (max) => z.string().trim().min(1).max(max);
+const baseUrlSchema = text(1000).refine((v) => {
+  try {
+    const u = new URL(v);
+    return (
+      ['http:', 'https:'].includes(u.protocol) && !u.username && !u.password && !u.search && !u.hash
+    );
+  } catch {
+    return false;
+  }
+}, '请输入不含账号、参数的 HTTP(S) Base URL');
+const protocolSchema = z.enum(['openai', 'anthropic']);
+const maxTokensSchema = z.number().int().min(256).max(1_000_000).default(4096);
+const tokenParameterSchema = z.enum(['max_tokens', 'max_completion_tokens']).default('max_tokens');
 export const modelSchema = z.object({
   name: text(80),
-  protocol: z.enum(['openai', 'anthropic']),
-  baseUrl: text(1000).refine((v) => {
-    try {
-      const u = new URL(v);
-      return (
-        ['http:', 'https:'].includes(u.protocol) &&
-        !u.username &&
-        !u.password &&
-        !u.search &&
-        !u.hash
-      );
-    } catch {
-      return false;
-    }
-  }, '请输入不含账号、参数的 HTTP(S) Base URL'),
+  protocol: protocolSchema,
+  baseUrl: baseUrlSchema,
   model: text(150),
   key: z.string().max(2000).optional(),
-  maxTokens: z.number().int().min(256).max(1_000_000).default(4096),
-  tokenParameter: z.enum(['max_tokens', 'max_completion_tokens']).default('max_tokens'),
+  maxTokens: maxTokensSchema,
+  tokenParameter: tokenParameterSchema,
+});
+// A connection test only needs the endpoint, the model and a key.
+export const testModelSchema = z.object({
+  id: text(100).optional(),
+  protocol: protocolSchema,
+  baseUrl: baseUrlSchema,
+  model: text(150),
+  key: z.string().max(2000).optional(),
+  maxTokens: maxTokensSchema,
+  tokenParameter: tokenParameterSchema,
 });
 export const taskSchema = z.object({
   title: text(140),
@@ -70,25 +80,45 @@ export function extractHtml(content) {
   return raw.slice(start, end >= 0 ? end + 7 : undefined);
 }
 
+// Reviewers give one holistic score per output; failed outputs are excluded.
 export function validateScores(bench, scores) {
-  const parsed = z.record(z.string(), z.record(z.string(), z.number().finite())).safeParse(scores);
+  const parsed = z.record(z.string(), z.number().int().min(0).max(100)).safeParse(scores);
   if (!parsed.success) throw new Error('评分格式不正确');
   const successful = bench.entries.filter((e) => e.status === 'done');
   if (!successful.length) throw new Error('没有可评分的成果');
   if (Object.keys(parsed.data).length !== successful.length)
     throw new Error('请为每份已完成的成果打分');
   for (const entry of successful) {
-    const criteria = bench.tasks.find((t) => t.id === entry.taskId).criteria;
-    const values = parsed.data[entry.id];
-    if (!values || Object.keys(values).length !== criteria.length)
-      throw new Error('请完成所有评分项');
-    for (const [i, criterion] of criteria.entries()) {
-      const value = values[String(i)];
-      if (!Number.isInteger(value) || value < 0 || value > criterion.maxScore)
-        throw new Error(`「${criterion.name}」评分应在 0 到 ${criterion.maxScore} 之间`);
-    }
+    if (parsed.data[entry.id] === undefined) throw new Error('请为每份已完成的成果打分');
   }
   return parsed.data;
+}
+
+// A single task can be revealed on its own, but only with a grade for every
+// successful output of that very task. Unknown entries are rejected so a
+// client bug never passes silently.
+export function validateTaskScores(bench, taskId, scores) {
+  const parsed = z.record(z.string(), z.number().int().min(0).max(100)).safeParse(scores ?? {});
+  if (!parsed.success) throw new Error('评分格式不正确');
+  const successful = bench.entries.filter((e) => e.taskId === taskId && e.status === 'done');
+  if (!successful.length) throw new Error('本题没有可评分的成果');
+  for (const entry of successful) {
+    if (parsed.data[entry.id] === undefined) throw new Error('请先为本题的每份成果打分');
+  }
+  const known = new Set(successful.map((e) => e.id));
+  if (Object.keys(parsed.data).some((id) => !known.has(id)))
+    throw new Error('评分包含了不属于本题的成果');
+  return Object.fromEntries(successful.map((e) => [e.id, parsed.data[e.id]]));
+}
+
+// Older ballots stored per-criterion scores; fold them into a 0-100 percentage.
+export function normalizeScore(value, criteriaMax) {
+  if (typeof value === 'number') return value;
+  if (value && typeof value === 'object') {
+    const sum = Object.values(value).reduce((a, b) => a + (typeof b === 'number' ? b : 0), 0);
+    return criteriaMax ? (sum / criteriaMax) * 100 : sum;
+  }
+  return null;
 }
 
 export function totals(bench, ballots) {
@@ -98,9 +128,8 @@ export function totals(bench, ballots) {
       const task = bench.tasks.find((t) => t.id === entry.taskId);
       const max = task.criteria.reduce((n, c) => n + c.maxScore, 0);
       const values = ballots
-        .map((b) => b.scores[entry.id])
-        .filter(Boolean)
-        .map((s) => (Object.values(s).reduce((a, b) => a + b, 0) / max) * 100);
+        .map((b) => normalizeScore(b.scores[entry.id], max))
+        .filter((v) => typeof v === 'number');
       return {
         entryId: entry.id,
         average: values.length

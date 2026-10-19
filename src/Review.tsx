@@ -15,6 +15,7 @@ import {
   Flag,
   Gift,
   LoaderCircle,
+  Lock,
   LockKeyhole,
   RotateCcw,
   Send,
@@ -26,6 +27,20 @@ import {
 import type { Bench, Entry, Scores, Task } from './types';
 import { api, reportError } from './api';
 import { Badge, Loading, Modal } from './ui';
+
+// Reviewers give one holistic grade per output instead of scoring every criterion.
+const LEVELS = [
+  { label: '很差', value: 25 },
+  { label: '一般', value: 50 },
+  { label: '可以', value: 75 },
+  { label: '非常好', value: 100 },
+];
+function levelLabel(value: number) {
+  return LEVELS.reduce(
+    (best, level) => (Math.abs(level.value - value) < Math.abs(best.value - value) ? level : best),
+    LEVELS[0],
+  ).label;
+}
 
 export default function Review({
   reference,
@@ -43,7 +58,8 @@ export default function Review({
   const base = `/${shared ? 'reviews' : 'benches'}/${reference}`;
   const [bench, setBench] = useState<Bench | null>(null);
   const [error, setError] = useState('');
-  const [taskIndex, setTaskIndex] = useState(0);
+  // The reviewer follows the active task; a manual pick may look back at earlier ones.
+  const [viewIndex, setViewIndex] = useState<number | null>(null);
   const [scores, setScores] = useState<Scores>(() => {
     try {
       return JSON.parse(localStorage.getItem(`fb-draft-${reference}`) || '{}');
@@ -57,19 +73,32 @@ export default function Review({
   const [shareOpen, setShareOpen] = useState(false);
   const [shareUrl, setShareUrl] = useState('');
   const [shareBusy, setShareBusy] = useState(false);
-  const [celebrate, setCelebrate] = useState(false);
+  const [celebrate, setCelebrate] = useState(0);
   const cardsRef = useRef<HTMLDivElement>(null);
   const activeRequest = useRef(false);
+  // 轮询与揭晓、投票的响应可能乱序，用版本号丢弃过期响应。
+  const version = useRef(0);
+  const lockedRef = useRef('');
   const load = useCallback(async () => {
     if (activeRequest.current) return;
     activeRequest.current = true;
+    const stamp = version.current;
     try {
       const data = await api<Bench>(base);
+      if (stamp !== version.current) return;
       setBench(data);
       setError('');
       if (data.myBallot) {
         setScores(data.myBallot.scores);
         setComment(data.myBallot.comment);
+      } else {
+        // 已揭晓题目的分数以服务端锁定值为准，覆盖本地草稿。
+        const locked = data.lockedScores ?? {};
+        const signature = JSON.stringify(locked);
+        if (signature !== lockedRef.current) {
+          lockedRef.current = signature;
+          setScores((current) => ({ ...current, ...locked }));
+        }
       }
     } catch (e) {
       setError(reportError(e));
@@ -81,18 +110,20 @@ export default function Review({
     const timer = setTimeout(() => void load(), 0);
     return () => clearTimeout(timer);
   }, [load]);
+  const generating =
+    bench?.entries.some((e) => e.status === 'running' || e.status === 'queued') ?? false;
   useEffect(() => {
-    if (bench?.status !== 'running') return;
+    if (!generating) return;
     const timer = setInterval(() => void load(), 1400);
     return () => clearInterval(timer);
-  }, [bench?.status, load]);
+  }, [generating, load]);
   useEffect(() => {
     if (bench && !bench.revealed)
       localStorage.setItem(`fb-draft-${reference}`, JSON.stringify(scores));
   }, [scores, bench, reference]);
   useEffect(() => {
     if (!celebrate) return;
-    const timer = setTimeout(() => setCelebrate(false), 3500);
+    const timer = setTimeout(() => setCelebrate(0), 3500);
     return () => clearTimeout(timer);
   }, [celebrate]);
   if (!bench)
@@ -111,30 +142,87 @@ export default function Review({
     ) : (
       <Loading text="正在准备神秘选手的成果…" />
     );
+  const taskIndex =
+    viewIndex !== null && viewIndex <= bench.activeIndex ? viewIndex : bench.activeIndex;
   const task = bench.tasks[taskIndex];
+  const activeTask = bench.tasks[bench.activeIndex];
   const entries = bench.order[task.id].map((id) => bench.entries.find((e) => e.id === id)!);
   const doneEntries = bench.entries.filter((e) => e.status === 'done');
-  const totalRatings = doneEntries.reduce(
-    (n, e) => n + bench.tasks.find((t) => t.id === e.taskId)!.criteria.length,
-    0,
-  );
-  const rated = doneEntries.reduce(
-    (n, e) =>
-      n +
-      bench.tasks
-        .find((t) => t.id === e.taskId)!
-        .criteria.filter((_, i) => scores[e.id]?.[String(i)] !== undefined).length,
-    0,
-  );
+  const totalRatings = doneEntries.length;
+  const rated = doneEntries.filter((e) => scores[e.id] !== undefined).length;
   const canSubmit = bench.status === 'done' && totalRatings > 0 && rated === totalRatings;
   const failed = bench.entries.filter((e) => e.status === 'failed').length;
-  function setScore(entryId: string, criterion: number, value: number | undefined) {
+  const activeEntries = bench.entries.filter((e) => e.taskId === activeTask.id);
+  const activeDone = activeEntries.filter((e) => e.status === 'done');
+  const activeSettled = activeEntries.filter((e) => ['done', 'failed'].includes(e.status)).length;
+  const activeGenerating = activeEntries.some((e) => ['queued', 'running'].includes(e.status));
+  const activeFinished = activeEntries.every((e) => ['done', 'failed'].includes(e.status));
+  const activeScoredCount = activeDone.filter((e) => scores[e.id] !== undefined).length;
+  const activeScored = activeScoredCount === activeDone.length;
+  const hasMoreTasks = bench.activeIndex < bench.tasks.length - 1;
+  const canContinue = activeFinished && activeScored;
+  // 正在看的那道题：进度、揭晓与卡片都指向它，避免各说各话。
+  const viewEntries = bench.entries.filter((e) => e.taskId === task.id);
+  const viewDone = viewEntries.filter((e) => e.status === 'done');
+  const viewFailed = viewEntries.filter((e) => e.status === 'failed');
+  const viewSettled = viewEntries.every((e) => ['done', 'failed'].includes(e.status));
+  const viewScoredCount = viewDone.filter((e) => scores[e.id] !== undefined).length;
+  const viewScored = viewScoredCount === viewDone.length;
+  const taskRevealed = bench.revealed || bench.revealedTasks.includes(task.id);
+  // 每一道题都单独揭晓过时，页面就是完整揭晓的样子，不必再说是“部分”。
+  const allTasksRevealed =
+    bench.tasks.length > 0 && bench.revealedTasks.length >= bench.tasks.length;
+  const identityFullyVisible = bench.revealed || allTasksRevealed;
+  const partialReveal = !identityFullyVisible && bench.revealedTasks.length > 0;
+  const canRevealTask =
+    !bench.revealed &&
+    !taskRevealed &&
+    viewSettled &&
+    !viewFailed.length &&
+    viewDone.length > 0 &&
+    viewScored;
+  const revealHint = taskRevealed
+    ? '本题身份已揭晓，评分已锁定'
+    : !viewSettled
+      ? '选手们还没有作答完成'
+      : viewFailed.length
+        ? `有 ${viewFailed.length} 份成果未生成成功`
+        : !viewScored
+          ? '先给本题的成果打分，再揭晓'
+          : '揭晓后本题评分将锁定';
+  function taskComplete(t: Task & { id: string }) {
+    const list = bench!.entries.filter((e) => e.taskId === t.id);
+    if (list.some((e) => !['done', 'failed'].includes(e.status))) return false;
+    return list.filter((e) => e.status === 'done').every((e) => scores[e.id] !== undefined);
+  }
+  function setScore(entryId: string, value: number | undefined) {
+    if (taskRevealed) return;
     setScores((current) => {
-      const entryScores = { ...current[entryId] };
-      if (value === undefined) delete entryScores[String(criterion)];
-      else entryScores[String(criterion)] = value;
-      return { ...current, [entryId]: entryScores };
+      const next = { ...current };
+      if (value === undefined) delete next[entryId];
+      else next[entryId] = value;
+      return next;
     });
+  }
+  // 单独揭晓一道题：先打分，再看它背后的模型，该题评分随即锁定。
+  async function revealTask() {
+    if (!canRevealTask || busy) return;
+    setBusy(true);
+    try {
+      const taskScores = Object.fromEntries(
+        entries.filter((e) => e.status === 'done').map((e) => [e.id, scores[e.id]]),
+      );
+      version.current += 1;
+      const data = await api<Bench>(`${base}/reveal`, { taskId: task.id, scores: taskScores });
+      // 揭晓先于轮询请求落地，作废两者之间返回的旧视图。
+      version.current += 1;
+      setBench(data);
+      setCelebrate((n) => n + 1);
+    } catch (e) {
+      notify(reportError(e));
+    } finally {
+      setBusy(false);
+    }
   }
   async function vote() {
     setBusy(true);
@@ -142,10 +230,12 @@ export default function Review({
       const validScores = Object.fromEntries(
         bench!.entries.filter((e) => e.status === 'done').map((e) => [e.id, scores[e.id]]),
       );
+      version.current += 1;
       const data = await api<Bench>(`${base}/vote`, { scores: validScores, comment });
+      version.current += 1;
       setBench(data);
       setSubmitOpen(false);
-      setCelebrate(true);
+      setCelebrate((n) => n + 1);
       localStorage.removeItem(`fb-draft-${reference}`);
       void onSubmitted();
       requestAnimationFrame(() =>
@@ -156,6 +246,18 @@ export default function Review({
             : 'smooth',
         }),
       );
+    } catch (e) {
+      notify(reportError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function continueNext() {
+    setBusy(true);
+    try {
+      await api(`/benches/${bench!.id}/next`, {});
+      setViewIndex(null);
+      await load();
     } catch (e) {
       notify(reportError(e));
     } finally {
@@ -206,19 +308,37 @@ export default function Review({
       <div className="review-heading">
         <div>
           <div className="eyebrow">
-            {bench.revealed ? 'THE BIG REVEAL' : 'LET THE ANSWERS SPEAK'}
+            {identityFullyVisible
+              ? 'THE BIG REVEAL'
+              : partialReveal
+                ? 'PARTIAL REVEAL'
+                : 'LET THE ANSWERS SPEAK'}
           </div>
           <h1>{bench.title}</h1>
           <p>
-            {bench.revealed
+            {identityFullyVisible
               ? '名字揭晓了。你的判断，值得被看见。'
-              : '先体验，再打分。你选的模型，正在匿名席上等你。'}
+              : partialReveal
+                ? '有的题目已经揭晓，其余仍在你手里。'
+                : '先体验，再打分。你选的模型，正在匿名席上等你。'}
           </p>
         </div>
-        <div className={`blind-status ${bench.revealed ? 'unlocked' : ''}`}>
-          {bench.revealed ? <Gift size={21} /> : <LockKeyhole size={21} />}
+        <div className={`blind-status ${identityFullyVisible ? 'unlocked' : ''}`}>
+          {identityFullyVisible ? (
+            <Gift size={21} />
+          ) : partialReveal ? (
+            <Eye size={21} />
+          ) : (
+            <LockKeyhole size={21} />
+          )}
           <div>
-            <strong>{bench.revealed ? '身份已揭晓' : '盲评进行中'}</strong>
+            <strong>
+              {identityFullyVisible
+                ? '身份已揭晓'
+                : partialReveal
+                  ? '部分题目已揭晓'
+                  : '盲评进行中'}
+            </strong>
             <span>
               {bench.participantCount} 位选手 · {bench.tasks.length} 道题目
             </span>
@@ -233,20 +353,18 @@ export default function Review({
           </button>
         </p>
       )}
-      {bench.status === 'running' && (
+      {activeGenerating && (
         <div className="generation-banner">
           <LoaderCircle size={19} className="spin" />
           <div>
-            <strong>选手们正在同时作答…</strong>
+            <strong>选手们正在作答第 {bench.activeIndex + 1} 题…</strong>
             <span>
-              已完成 {doneEntries.length} / {bench.entries.length}{' '}
-              份成果。可以先看已完成的答案，全部结束后提交评分。
+              本题已完成 {activeSettled} / {activeEntries.length}{' '}
+              份成果。作答结束后即可评分，再继续下一题。
             </span>
           </div>
           <div className="mini-progress">
-            <i
-              style={{ width: `${((doneEntries.length + failed) / bench.entries.length) * 100}%` }}
-            />
+            <i style={{ width: `${(activeSettled / activeEntries.length) * 100}%` }} />
           </div>
         </div>
       )}
@@ -268,25 +386,25 @@ export default function Review({
       {bench.tasks.length > 1 && (
         <div className="task-tabs" aria-label="测试题目">
           {bench.tasks.map((t, i) => {
-            const total =
-              bench.entries.filter((e) => e.taskId === t.id && e.status === 'done').length *
-              t.criteria.length;
-            const count = bench.entries
-              .filter((e) => e.taskId === t.id && e.status === 'done')
-              .reduce(
-                (n, e) =>
-                  n + t.criteria.filter((_, ci) => scores[e.id]?.[String(ci)] !== undefined).length,
-                0,
-              );
+            const started = i <= bench.activeIndex;
+            const complete = started && taskComplete(t);
+            const revealed = bench.revealed || bench.revealedTasks.includes(t.id);
             return (
               <button
-                className={taskIndex === i ? 'active' : ''}
+                className={`${taskIndex === i ? 'active' : ''} ${started ? '' : 'locked'}`}
                 key={t.id}
-                onClick={() => setTaskIndex(i)}
+                disabled={!started}
+                onClick={() => started && setViewIndex(i)}
               >
                 <span>0{i + 1}</span>
                 {t.title}
-                {total > 0 && count === total && <CheckCircle2 size={14} />}
+                {revealed ? (
+                  <Eye size={14} />
+                ) : started ? (
+                  complete && <CheckCircle2 size={14} />
+                ) : (
+                  <Lock size={13} />
+                )}
               </button>
             );
           })}
@@ -296,10 +414,10 @@ export default function Review({
         <summary>
           <span>
             <FileText size={17} />
-            本轮题目与评分依据
+            本题题目与评分依据
           </span>
           <span>
-            {task.criteria.reduce((n, c) => n + c.maxScore, 0)} 分制
+            {task.criteria.reduce((n, c) => n + c.maxScore, 0)} 分制 · 仅供参考
             <ChevronDown size={17} />
           </span>
         </summary>
@@ -323,10 +441,22 @@ export default function Review({
         </div>
       </details>
       <div className="comparison-title">
-        <h2>{bench.revealed ? '回看这些答案' : '神秘选手，已就位。'}</h2>
+        <h2>
+          {identityFullyVisible
+            ? '回看这些答案'
+            : taskRevealed
+              ? '这一题，揭晓了。'
+              : '神秘选手，已就位。'}
+        </h2>
         <span>
           <ShieldCheck size={14} />
-          {bench.revealed ? '评分已锁定，保留第一判断' : '随机排列 · 提交评分后揭晓'}
+          {identityFullyVisible
+            ? '评分已锁定，保留第一判断'
+            : taskRevealed
+              ? '本题身份已揭晓，评分已锁定'
+              : taskIndex === bench.activeIndex
+                ? '按整体印象给一个档位，不必逐条打分'
+                : '这是已完成的题目，可回看或调整档位'}
         </span>
       </div>
       <div ref={cardsRef} className={`entry-grid count-${entries.length}`}>
@@ -336,12 +466,14 @@ export default function Review({
             entry={entry}
             index={index}
             task={task}
-            revealed={bench.revealed}
-            animateReveal={celebrate}
+            identityVisible={taskRevealed}
+            scoresLocked={taskRevealed}
+            communityVisible={bench.revealed}
+            animateReveal={celebrate > 0}
             average={bench.results?.find((r) => r.entryId === entry.id)?.average}
             voterCount={bench.voterCount}
-            values={scores[entry.id] || {}}
-            setScore={(ci, value) => setScore(entry.id, ci, value)}
+            value={scores[entry.id]}
+            setScore={(value) => setScore(entry.id, value)}
           />
         ))}
       </div>
@@ -364,37 +496,111 @@ export default function Review({
               onChange={(e) => setComment(e.target.value)}
             />
           </section>
-          <div className="vote-dock">
-            <div>
-              <div className="vote-progress">
-                <span>你的评分进度</span>
-                <strong>
-                  {rated} / {totalRatings}
-                </strong>
+          {hasMoreTasks ? (
+            <div className="vote-dock">
+              <div>
+                <div className="vote-progress">
+                  <span>本题评分进度</span>
+                  <strong>
+                    {viewScoredCount} / {viewDone.length}
+                  </strong>
+                </div>
+                <div className="progress-track">
+                  <i
+                    style={{
+                      width: `${viewDone.length ? (viewScoredCount / viewDone.length) * 100 : 0}%`,
+                    }}
+                  />
+                </div>
+                <small>
+                  {taskIndex !== bench.activeIndex
+                    ? `正在回看第 ${taskIndex + 1} 题，${
+                        bench.owner ? '完成当前题后可继续下一道题' : '等待创建者继续下一道题'
+                      }`
+                    : !bench.owner
+                      ? '等待创建者继续下一道题'
+                      : activeGenerating
+                        ? '选手们正在作答本题，作答结束后即可评分'
+                        : !activeFinished
+                          ? '本题尚未作答结束'
+                          : !activeScored
+                            ? `给本题的 ${activeDone.length} 份成果各选一个档位，再继续下一题`
+                            : '本题已完成，点击继续下一道题'}
+                </small>
               </div>
-              <div className="progress-track">
-                <i style={{ width: `${totalRatings ? (rated / totalRatings) * 100 : 0}%` }} />
+              <div className="vote-dock-actions">
+                <div className="reveal-action">
+                  <button
+                    className="button secondary"
+                    disabled={!canRevealTask || busy}
+                    onClick={revealTask}
+                    title={revealHint}
+                  >
+                    <Eye size={16} />
+                    立即揭晓第 {taskIndex + 1} 题
+                  </button>
+                  <small className="reveal-hint">{revealHint}</small>
+                </div>
+                {bench.owner && (
+                  <button
+                    className="button primary large"
+                    disabled={!canContinue || busy}
+                    onClick={continueNext}
+                  >
+                    <ArrowRight size={19} />
+                    继续测试下一个
+                    <ArrowRight size={17} />
+                  </button>
+                )}
               </div>
-              <small>
-                {bench.status === 'running'
-                  ? '等待选手全部交卷，评分草稿会保留'
-                  : !totalRatings
-                    ? '没有可评分的成果，请检查模型设置或重试'
-                    : canSubmit
-                      ? '准备好了吗？答案马上揭晓。'
-                      : '完成每份成果的所有评分项，即可揭晓'}
-              </small>
             </div>
-            <button
-              className="button primary large"
-              disabled={!canSubmit || busy}
-              onClick={() => setSubmitOpen(true)}
-            >
-              <Gift size={19} />
-              提交评分，揭晓身份
-              <ArrowRight size={17} />
-            </button>
-          </div>
+          ) : (
+            <div className="vote-dock">
+              <div>
+                <div className="vote-progress">
+                  <span>你的评分进度</span>
+                  <strong>
+                    {rated} / {totalRatings}
+                  </strong>
+                </div>
+                <div className="progress-track">
+                  <i style={{ width: `${totalRatings ? (rated / totalRatings) * 100 : 0}%` }} />
+                </div>
+                <small>
+                  {bench.status === 'running'
+                    ? '等待选手全部交卷，评分草稿会保留'
+                    : !totalRatings
+                      ? '没有可评分的成果，请检查模型设置或重试'
+                      : canSubmit
+                        ? '准备好了吗？答案马上揭晓。'
+                        : '给每份成果选一个档位，即可揭晓'}
+                </small>
+              </div>
+              <div className="vote-dock-actions">
+                <div className="reveal-action">
+                  <button
+                    className="button secondary"
+                    disabled={!canRevealTask || busy}
+                    onClick={revealTask}
+                    title={revealHint}
+                  >
+                    <Eye size={16} />
+                    立即揭晓第 {taskIndex + 1} 题
+                  </button>
+                  <small className="reveal-hint">{revealHint}</small>
+                </div>
+                <button
+                  className="button primary large"
+                  disabled={!canSubmit || busy}
+                  onClick={() => setSubmitOpen(true)}
+                >
+                  <Gift size={19} />
+                  提交评分，揭晓身份
+                  <ArrowRight size={17} />
+                </button>
+              </div>
+            </div>
+          )}
         </>
       ) : (
         <div className="after-review">
@@ -486,30 +692,34 @@ function EntryCard({
   entry,
   index,
   task,
-  revealed,
+  identityVisible,
+  scoresLocked,
+  communityVisible,
   animateReveal,
   average,
   voterCount,
-  values,
+  value,
   setScore,
 }: {
   entry: Entry;
   index: number;
   task: Task;
-  revealed: boolean;
+  identityVisible: boolean;
+  scoresLocked: boolean;
+  communityVisible: boolean;
   animateReveal: boolean;
   average?: number | null;
   voterCount?: number;
-  values: Record<string, number>;
-  setScore: (index: number, score: number | undefined) => void;
+  value: number | undefined;
+  setScore: (value: number | undefined) => void;
 }) {
   const [tab, setTab] = useState<'preview' | 'raw'>('preview');
   const [reset, setReset] = useState(0);
   const [full, setFull] = useState(false);
-  const [faceRevealed, setFaceRevealed] = useState(revealed);
+  const [faceRevealed, setFaceRevealed] = useState(identityVisible);
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const playing = revealed && animateReveal && !reducedMotion;
-  const showIdentity = revealed && (!playing || faceRevealed);
+  const playing = identityVisible && animateReveal && !reducedMotion;
+  const showIdentity = identityVisible && (!playing || faceRevealed);
   useEffect(() => {
     if (!playing) return;
     // Swap identities at the edge of the turn, while the card face is out of view.
@@ -517,7 +727,7 @@ function EntryCard({
     return () => clearTimeout(timer);
   }, [playing, index]);
   const letter = String.fromCharCode(65 + index);
-  const complete = task.criteria.every((_, i) => values[String(i)] !== undefined);
+  const complete = value !== undefined;
   const html = entry.html ? secureHtml(entry.html) : '';
   function download() {
     const url = URL.createObjectURL(
@@ -627,7 +837,7 @@ function EntryCard({
             <div className="truncated-note">未找到完整 HTML，已展示原始回答。</div>
           )}
           <div className="score-panel">
-            {revealed && (
+            {communityVisible && (
               <div
                 className="card-community-score"
                 style={{ visibility: showIdentity ? 'visible' : 'hidden' }}
@@ -643,62 +853,33 @@ function EntryCard({
               </div>
             )}
             <div className="score-title">
-              <strong>{revealed ? '你的评分' : '你的直觉，值几分？'}</strong>
+              <strong>{scoresLocked ? '你的评分' : '你的直觉，值几分？'}</strong>
               <span>
-                {Object.keys(values).length
-                  ? Object.values(values).reduce((a, b) => a + b, 0)
-                  : '-'}
-                <small> / {task.criteria.reduce((n, c) => n + c.maxScore, 0)}</small>
+                {value === undefined ? (
+                  '-'
+                ) : (
+                  <>
+                    {levelLabel(value)}
+                    <small> · {value} / 100</small>
+                  </>
+                )}
               </span>
             </div>
-            {task.criteria.map((criterion, ci) => (
-              <div className="score-row" key={ci}>
-                <div className="score-label">
-                  <label htmlFor={`score-${entry.id}-${ci}`}>{criterion.name}</label>
-                  <span>
-                    {values[String(ci)] === undefined ? '未评分' : `${values[String(ci)]} 分`}
-                  </span>
-                </div>
-                <p>{criterion.description}</p>
-                <div className="score-control">
-                  <input
-                    id={`score-${entry.id}-${ci}`}
-                    type="range"
-                    min={0}
-                    max={criterion.maxScore}
-                    step={1}
-                    value={values[String(ci)] ?? 0}
-                    disabled={revealed}
-                    aria-label={`选手 ${letter} ${criterion.name}`}
-                    aria-valuetext={
-                      values[String(ci)] === undefined ? '尚未评分' : `${values[String(ci)]} 分`
-                    }
-                    onChange={(e) => setScore(ci, Number(e.target.value))}
-                    onPointerUp={(e) => {
-                      if (!revealed) setScore(ci, Number(e.currentTarget.value));
-                    }}
-                  />
-                  <input
-                    type="number"
-                    min={0}
-                    max={criterion.maxScore}
-                    step={1}
-                    placeholder="-"
-                    value={values[String(ci)] ?? ''}
-                    disabled={revealed}
-                    aria-label={`选手 ${letter} ${criterion.name} 分数`}
-                    onChange={(e) => {
-                      if (e.target.value === '') setScore(ci, undefined);
-                      else {
-                        const n = Number(e.target.value);
-                        if (Number.isInteger(n) && n >= 0 && n <= criterion.maxScore)
-                          setScore(ci, n);
-                      }
-                    }}
-                  />
-                </div>
-              </div>
-            ))}
+            <div className="fuzzy-score" role="group" aria-label={`选手 ${letter} 评分`}>
+              {LEVELS.map((level) => (
+                <button
+                  key={level.value}
+                  type="button"
+                  className={value === level.value ? 'active' : ''}
+                  disabled={scoresLocked}
+                  aria-pressed={value === level.value}
+                  onClick={() => setScore(value === level.value ? undefined : level.value)}
+                >
+                  <span>{level.label}</span>
+                  <small>{level.value}</small>
+                </button>
+              ))}
+            </div>
           </div>
         </>
       ) : (
@@ -729,7 +910,7 @@ function EntryCard({
       )}
       {full && (
         <Modal
-          title={`选手 ${letter} · ${revealed ? entry.model?.name : '匿名成果'}`}
+          title={`选手 ${letter} · ${identityVisible ? entry.model?.name : '匿名成果'}`}
           wide
           onClose={() => setFull(false)}
         >

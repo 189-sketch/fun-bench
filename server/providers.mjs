@@ -1,7 +1,11 @@
 import { endpoint } from './domain.mjs';
 
 export const GENERATION_TIMEOUT_MS = 30 * 60 * 1000;
+export const TEST_TIMEOUT_MS = 60 * 1000;
 const MAX_OUTPUT_CHARS = 16_000_000;
+// The connection test stops reading as soon as the model proves it can answer.
+const TEST_MAX_CHARS = 800;
+export const TEST_PROMPT = '请用一句话回复：连接正常';
 
 function providerError(message) {
   const error = new Error(message);
@@ -28,6 +32,16 @@ async function httpError(response) {
       `服务返回 HTTP ${response.status}：请求参数被拒绝，请检查输出 Tokens 上限、模型 ID 和所选协议`,
     );
   }
+  if ([401, 403].includes(response.status))
+    return providerError(
+      `服务返回 HTTP ${response.status}：鉴权未通过，请检查 API Key 是否正确、是否已过期，以及是否有权访问该模型`,
+    );
+  if (response.status === 404)
+    return providerError('服务返回 HTTP 404：接口或模型不存在，请检查 Base URL 与 Model ID');
+  if (response.status === 429)
+    return providerError(
+      `服务返回 HTTP ${response.status}：触发额度或速率限制，请稍后重试或检查账户余额`,
+    );
   if ([408, 504].includes(response.status))
     return providerError(`服务返回 HTTP ${response.status}：上游网关等待超时，请稍后重试`);
   return providerError(`服务返回 HTTP ${response.status}，请检查模型配置或额度`);
@@ -122,7 +136,7 @@ export async function generate(model, key, prompt, options = {}) {
   function append(text) {
     content += text;
     if (content.length > MAX_OUTPUT_CHARS) throw providerError('返回内容超出 1600 万字符限制');
-    options.onProgress?.(content.length);
+    options.onProgress?.(content.length, content);
   }
   if (response.headers.get('content-type')?.includes('text/event-stream')) {
     stopReason = await readStream(response, model.protocol, append);
@@ -144,4 +158,34 @@ export async function generate(model, key, prompt, options = {}) {
   }
   if (!content.trim()) throw providerError('服务未返回可展示的文本内容');
   return { content, truncated: ['length', 'max_tokens'].includes(stopReason) };
+}
+
+export function connectionError(error) {
+  if (['TimeoutError', 'AbortError'].includes(error.name))
+    return '连接测试超过 60 秒未完成，请检查网络、服务地址或模型响应速度';
+  if (error.name === 'ProviderError' || error.message?.startsWith('模型配置')) return error.message;
+  return '连接中断或无法连接服务，请检查网络、Base URL 和 API Key';
+}
+
+// Sends one real request through the configured protocol, so the test proves
+// the same path a benchmark run uses: endpoint, authentication and model ID.
+export async function testConnection(model, key) {
+  const started = Date.now();
+  const controller = new AbortController();
+  let reply = '';
+  try {
+    const result = await generate(model, key, TEST_PROMPT, {
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(TEST_TIMEOUT_MS)]),
+      onProgress(_size, text) {
+        reply = text;
+        if (text.length >= TEST_MAX_CHARS) controller.abort();
+      },
+    });
+    reply = result.content;
+  } catch (err) {
+    // Text already received proves the configuration works, even when the
+    // stream was cut short by our own early stop.
+    if (!reply.trim()) throw err;
+  }
+  return { reply: reply.trim().slice(0, 200), latency: Date.now() - started };
 }

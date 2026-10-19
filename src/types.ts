@@ -9,6 +9,12 @@ export interface ModelConfig {
   tokenParameter: 'max_tokens' | 'max_completion_tokens';
   hasKey: boolean;
 }
+export interface ModelTestResult {
+  ok: boolean;
+  reply?: string;
+  latency?: number;
+  error?: string;
+}
 export interface Criterion {
   name: string;
   description: string;
@@ -35,7 +41,7 @@ export interface BenchSummary {
 export interface Entry {
   id: string;
   taskId: string;
-  status: 'queued' | 'running' | 'done' | 'failed';
+  status: 'pending' | 'queued' | 'running' | 'done' | 'failed';
   content?: string;
   html?: string | null;
   truncated?: boolean;
@@ -44,7 +50,7 @@ export interface Entry {
   model?: { id: string; name: string; model: string; protocol: string };
   duration?: number;
 }
-export type Scores = Record<string, Record<string, number>>;
+export type Scores = Record<string, number>;
 export interface Bench {
   id: string;
   title: string;
@@ -52,11 +58,14 @@ export interface Bench {
   demo?: boolean;
   status: 'running' | 'done';
   tasks: (Task & { id: string })[];
+  activeIndex: number;
   participantCount: number;
   owner: boolean;
   sharePath?: string;
   order: Record<string, string[]>;
   revealed: boolean;
+  revealedTasks: string[];
+  lockedScores: Scores;
   myBallot: { scores: Scores; comment: string } | null;
   entries: Entry[];
   results?: { entryId: string; average: number | null; count: number }[];

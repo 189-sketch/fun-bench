@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { endpoint, validateScores, totals, extractHtml } from '../server/domain.mjs';
+import {
+  endpoint,
+  validateScores,
+  validateTaskScores,
+  totals,
+  extractHtml,
+} from '../server/domain.mjs';
 import { parseImport, parseCriteria, EXAMPLE } from '../src/import.ts';
 
 test('accepts protocol roots, versioned bases and full endpoints without duplicating paths', () => {
@@ -55,23 +61,35 @@ const bench = {
     { id: 'b', taskId: 't', status: 'failed' },
   ],
 };
-test('ratings require every successful entry and dimension, support deliberate zero, reject out-of-range and forged entries', () => {
-  assert.deepEqual(validateScores(bench, { a: { 0: 0, 1: 60 } }), { a: { 0: 0, 1: 60 } });
-  for (const scores of [
-    {},
-    { a: { 0: 20 } },
-    { a: { 0: 41, 1: 50 } },
-    { a: { 0: 20.5, 1: 50 } },
-    { a: { 0: 20, 1: 50 }, b: { 0: 40, 1: 60 } },
-  ])
+test('ratings require one holistic grade for every successful entry, support zero, reject out-of-range and forged entries', () => {
+  assert.deepEqual(validateScores(bench, { a: 0 }), { a: 0 });
+  assert.deepEqual(validateScores(bench, { a: 100 }), { a: 100 });
+  for (const scores of [{}, { a: 101 }, { a: -1 }, { a: 20.5 }, { a: 20, b: 60 }])
     assert.throws(() => validateScores(bench, scores));
 });
-test('community scores normalize different point scales and exclude failed outputs', () => {
-  const result = totals(bench, [
-    { scores: { a: { 0: 20, 1: 30 } } },
-    { scores: { a: { 0: 40, 1: 60 } } },
-  ]);
+test('a single task can only be revealed with a grade for every successful output of that very task', () => {
+  const twoTasks = {
+    tasks: [
+      { id: 't', criteria: [{ name: '准确性', maxScore: 100 }] },
+      { id: 'u', criteria: [{ name: '完整性', maxScore: 100 }] },
+    ],
+    entries: [
+      { id: 'a', taskId: 't', status: 'done' },
+      { id: 'b', taskId: 't', status: 'failed' },
+      { id: 'c', taskId: 'u', status: 'done' },
+    ],
+  };
+  assert.deepEqual(validateTaskScores(twoTasks, 't', { a: 75 }), { a: 75 });
+  for (const scores of [{}, undefined, { a: 101 }, { a: 12.5 }, { a: 75, c: 50 }, { b: 50 }])
+    assert.throws(() => validateTaskScores(twoTasks, 't', scores));
+});
+test('community scores average holistic grades and fold legacy per-criterion ballots', () => {
+  const result = totals(bench, [{ scores: { a: 50 } }, { scores: { a: 100 } }]);
   assert.deepEqual(result, [{ entryId: 'a', average: 75, count: 2 }]);
+  // Legacy ballots stored per-criterion values; they normalize to a 0-100 percentage.
+  assert.deepEqual(totals(bench, [{ scores: { a: { 0: 20, 1: 30 } } }]), [
+    { entryId: 'a', average: 50, count: 1 },
+  ]);
 });
 test('extracts runnable HTML from model prose without treating ordinary text as code', () => {
   assert.equal(

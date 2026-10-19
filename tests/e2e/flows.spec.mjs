@@ -1,8 +1,33 @@
 import { test, expect } from '@playwright/test';
 
-async function scoreAll(page, demo = true) {
-  const fields = page.getByRole('spinbutton', { name: /选手 .* 分数/ });
-  for (let i = 0; i < (await fields.count()); i++) await fields.nth(i).fill(demo ? '20' : '10');
+// 成果可能陆续到达，且重复点击同一个档位会取消评分。
+// 因此只给尚未打分的成果点档位，并持续到指定的按钮变为可用。
+async function scoreAll(page, ready) {
+  const target = ready || page.getByRole('button', { name: '提交评分，揭晓身份' });
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const cards = page.locator('.entry-card');
+    const count = await cards.count();
+    for (let i = 0; i < count; i++) {
+      const card = cards.nth(i);
+      if ((await card.getAttribute('class'))?.includes('scored')) continue;
+      const button = card.locator('.fuzzy-score button', { hasText: '可以' });
+      if (!(await button.count())) continue;
+      if ((await button.getAttribute('aria-pressed')) === 'true') continue;
+      await button.click();
+      await expect(card).toHaveClass(/scored/);
+    }
+    if ((await target.count()) && (await target.isEnabled())) return;
+    await page.waitForTimeout(250);
+  }
+  await expect(target).toBeEnabled();
+}
+// 演示成果运行在 sandbox iframe 内。移动端模拟下，iframe 首帧落定前的首次点击
+// 偶发丢失，因此重试直到模式真正切换（切换动作是幂等的，重复点击安全）。
+async function clickUntilText(frame, name, expected) {
+  await expect(async () => {
+    await frame.getByRole('button', { name }).click();
+    await expect(frame.getByText(expected, { exact: true })).toBeVisible({ timeout: 800 });
+  }).toPass({ timeout: 15000 });
 }
 async function reveal(page) {
   await page.getByRole('button', { name: '提交评分，揭晓身份' }).click();
@@ -22,8 +47,7 @@ test('demo: playable anonymous artifacts, reload-safe draft, reveal and independ
   await expect(page.getByRole('heading', { name: /纸飞机|小彗星|夜航船/ })).toHaveCount(0);
   const frame = page.frameLocator('iframe[title="选手 A 成果"]');
   await expect(frame.getByText('25:00', { exact: true })).toBeVisible();
-  await frame.getByRole('button', { name: /休息/ }).click();
-  await expect(frame.getByText('05:00', { exact: true })).toBeVisible();
+  await clickUntilText(frame, /休息/, '05:00');
   await page.getByRole('button', { name: '重置选手 A 成果' }).click();
   await expect(frame.getByText('25:00', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '提交评分，揭晓身份' })).toBeDisabled();
@@ -48,7 +72,9 @@ test('demo: playable anonymous artifacts, reload-safe draft, reveal and independ
   await expect(page.getByRole('heading', { name: /纸飞机|小彗星|夜航船/ })).toHaveCount(3);
   await expect(frame.getByText('25:00', { exact: true })).toBeVisible();
   await expect(page.getByText('1 人盲评均分')).toHaveCount(3);
-  await expect(page.getByRole('spinbutton', { name: '选手 A 功能完整性 分数' })).toBeDisabled();
+  await expect(
+    page.locator('.entry-card').first().locator('.fuzzy-score button').first(),
+  ).toBeDisabled();
   await page.reload();
   await expect(page.getByRole('heading', { name: /纸飞机|小彗星|夜航船/ })).toHaveCount(3);
   await expect(page.locator('.entry-card.reveal-playing')).toHaveCount(0);
@@ -98,21 +124,50 @@ test('real configuration flow: both protocol forms, agent import, parallel gener
   await page.getByRole('button', { name: /我的 OpenAI 选手/ }).click();
   await page.getByRole('button', { name: /我的 Claude 选手/ }).click();
   await page.getByRole('button', { name: '下一步', exact: true }).click();
-  await page.getByRole('button', { name: '开始并行测试', exact: true }).click();
+  await page.getByRole('button', { name: '开始测试', exact: true }).click();
   await expect(page.getByRole('heading', { name: '神秘选手 A', exact: true })).toBeVisible();
   await expect(page.getByText('访谈分析', { exact: true }).first()).toBeVisible();
   await expect(page.getByRole('table').first()).toBeVisible();
-  await scoreAll(page, false);
+  await scoreAll(page);
   await reveal(page);
   await expect(page.getByRole('heading', { name: '我的 OpenAI 选手', exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: '我的 Claude 选手', exact: true })).toBeVisible();
 });
 
+test('model connection test: draft and saved configurations report a working or broken model', async ({
+  page,
+}) => {
+  await page.goto('/models');
+  await page.getByRole('button', { name: '添加模型', exact: true }).click();
+  await page.getByLabel('显示名称', { exact: true }).fill('连接测试选手');
+  await page.getByLabel('Base URL', { exact: true }).fill('http://127.0.0.1:4174/v1');
+  await page.getByLabel('Model ID', { exact: true }).fill('mock-openai');
+  await page.getByLabel('API Key', { exact: true }).fill('e2e-fake-key');
+  await page.getByRole('button', { name: '测试连接' }).click();
+  await expect(page.getByText(/连接正常/)).toBeVisible();
+  await page.getByRole('button', { name: '保存模型', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '连接测试选手' })).toBeVisible();
+  await page.getByRole('button', { name: '测试 连接测试选手 连接' }).click();
+  await expect(page.getByText(/连接正常/)).toBeVisible();
+  await page.getByRole('button', { name: '添加模型', exact: true }).click();
+  await page.getByLabel('显示名称', { exact: true }).fill('无法连接选手');
+  await page.getByLabel('Base URL', { exact: true }).fill('http://127.0.0.1:4174/v1');
+  await page.getByLabel('Model ID', { exact: true }).fill('mock-fail');
+  await page.getByLabel('API Key', { exact: true }).fill('e2e-secret-key');
+  await page.getByRole('button', { name: '保存模型', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '无法连接选手' })).toBeVisible();
+  await page.getByRole('button', { name: '测试 无法连接选手 连接' }).click();
+  await expect(page.getByText(/服务返回 HTTP 401/)).toBeVisible();
+  await expect(page.getByText('e2e-secret-key', { exact: false })).toHaveCount(0);
+});
+
 test('multiple tasks require complete scores and upstream failures remain anonymous', async ({
   page,
 }) => {
-  await page.goto('/');
   const request = page.context().request;
+  // Establish the session deterministically before the app fires its own parallel requests.
+  await request.get('/api/health');
+  await page.goto('/');
   const models = [];
   for (const model of ['mock-openai', 'mock-fail']) {
     const response = await request.post('/api/models', {
@@ -147,20 +202,94 @@ test('multiple tasks require complete scores and upstream failures remain anonym
   await expect(page.getByText('这位选手暂时掉线了', { exact: true })).toBeVisible();
   await expect(page.getByText(/服务返回 HTTP 401/)).toBeVisible();
   await expect(page.getByText('failure-test-secret', { exact: false })).toHaveCount(0);
-  await page.getByRole('spinbutton', { name: /分数/ }).fill('0');
-  await expect(page.getByRole('button', { name: '提交评分，揭晓身份' })).toBeDisabled();
-  await page.getByRole('button', { name: /02.*题目二/ }).click();
-  await page.getByRole('spinbutton', { name: /分数/ }).fill('10');
+  // 第 2 题在继续之前保持锁定
+  await expect(page.getByRole('button', { name: /02.*题目二/ })).toBeDisabled();
+  const next = page.getByRole('button', { name: '继续测试下一个' });
+  await expect(next).toBeDisabled();
+  await expect(page.getByRole('button', { name: '提交评分，揭晓身份' })).toHaveCount(0);
+  await scoreAll(page, next);
+  await expect(next).toBeEnabled();
+  await next.click();
+  // 第 2 题开始作答，等待其成果出现后再评分
+  await expect(page.locator('.entry-card .fuzzy-score').first()).toBeVisible({ timeout: 20000 });
+  await scoreAll(page);
   await expect(page.getByRole('button', { name: '提交评分，揭晓身份' })).toBeEnabled();
   await reveal(page);
   await expect(page.getByRole('heading', { name: 'mock-openai', exact: true })).toBeVisible();
 });
 
+test('a single question can be revealed on its own, locking only that question', async ({
+  page,
+}) => {
+  const request = page.context().request;
+  // Establish the session deterministically before the app fires its own parallel requests.
+  await request.get('/api/health');
+  const modelIds = [];
+  for (const [name, protocol, model] of [
+    ['隐藏的 openai', 'openai', 'mock-openai'],
+    ['隐藏的 anthropic', 'anthropic', 'mock-anthropic'],
+  ]) {
+    const response = await request.post('/api/models', {
+      data: {
+        name,
+        protocol,
+        baseUrl: 'http://127.0.0.1:4174/v1',
+        model,
+        key: 'reveal-e2e-secret',
+      },
+    });
+    modelIds.push((await response.json()).id);
+  }
+  const task = {
+    prompt: '完成一件真实的事。',
+    evaluation: '是否真的有用',
+    format: 'text',
+    criteria: [{ name: '帮助程度', maxScore: 100 }],
+  };
+  const response = await request.post('/api/benches', {
+    data: {
+      title: '单题揭晓',
+      modelIds,
+      tasks: [
+        { ...task, title: '题目一' },
+        { ...task, title: '题目二' },
+      ],
+    },
+  });
+  const { id } = await response.json();
+  await page.goto(`/bench/${id}`);
+  // 第 1 题作答完成前不能揭晓
+  const revealOne = page.getByRole('button', { name: '立即揭晓第 1 题' });
+  await expect(revealOne).toBeDisabled();
+  const next = page.getByRole('button', { name: '继续测试下一个' });
+  await scoreAll(page, next);
+  await expect(revealOne).toBeEnabled();
+  await revealOne.click();
+  // 第 1 题揭晓身份，且该题评分锁定
+  await expect(page.getByRole('heading', { name: '隐藏的 openai', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '隐藏的 anthropic', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '神秘选手 A', exact: true })).toHaveCount(0);
+  await expect(page.locator('.entry-card .fuzzy-score button').first()).toBeDisabled();
+  // 其它题目仍然匿名
+  await next.click();
+  await expect(page.locator('.entry-card .fuzzy-score').first()).toBeVisible({ timeout: 20000 });
+  await expect(page.getByRole('heading', { name: '神秘选手 A', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '隐藏的 openai', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '立即揭晓第 2 题' })).toBeDisabled();
+  // 全部完成后照常提交揭晓
+  await scoreAll(page);
+  await expect(page.getByRole('button', { name: '提交评分，揭晓身份' })).toBeEnabled();
+  await reveal(page);
+  await expect(page.getByRole('heading', { name: '隐藏的 openai', exact: true })).toBeVisible();
+});
+
 test('slow providers finish through streaming without dropping anonymous contestants', async ({
   page,
 }, testInfo) => {
-  await page.goto('/');
   const request = page.context().request;
+  // Establish the session deterministically before the app fires its own parallel requests.
+  await request.get('/api/health');
+  await page.goto('/');
   const modelIds = [];
   for (const protocol of ['openai', 'anthropic']) {
     const response = await request.post('/api/models', {
@@ -199,7 +328,7 @@ test('slow providers finish through streaming without dropping anonymous contest
     path: `artifacts/streaming-${testInfo.project.name}.png`,
     fullPage: true,
   });
-  await scoreAll(page, false);
+  await scoreAll(page);
   await reveal(page);
 });
 

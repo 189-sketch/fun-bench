@@ -4,13 +4,16 @@ import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import {
   modelSchema,
+  testModelSchema,
   createBenchSchema,
   buildPrompt,
   extractHtml,
   validateScores,
+  validateTaskScores,
+  normalizeScore,
   totals,
 } from './domain.mjs';
-import { generate, generationError } from './providers.mjs';
+import { generate, generationError, testConnection, connectionError } from './providers.mjs';
 import { demoTask, demoEntries } from './demo.mjs';
 
 const id = () => randomBytes(18).toString('base64url');
@@ -27,6 +30,9 @@ const publicModel = ({ encryptedKey: _key, owner: _owner, ...model }) => ({
   ...model,
   hasKey: Boolean(_key),
 });
+// A revealed identity carries no endpoint or credential material: the base URL
+// alone would fingerprint the vendor behind a generic display name.
+const publicIdentity = ({ id, name, model, protocol }) => ({ id, name, model, protocol });
 const log = (event, data) =>
   console.info(JSON.stringify({ time: new Date().toISOString(), event, ...data }));
 
@@ -50,6 +56,7 @@ export function createApp(store) {
     store.put('bench', bench, bench.owner);
   }
   // Interrupted requests are not automatically replayed, to avoid unexpected charges.
+  // Tasks the user had not started yet stay pending, so the sequential flow can continue.
   for (const bench of store.all('bench')) {
     if (bench.status === 'running') {
       bench.entries.forEach((e) => {
@@ -58,7 +65,7 @@ export function createApp(store) {
           e.error = '服务重启中断了本次生成，可手动重试';
         }
       });
-      bench.status = 'done';
+      if (bench.entries.every((e) => ['done', 'failed'].includes(e.status))) bench.status = 'done';
       persistBench(bench);
     }
   }
@@ -114,6 +121,13 @@ export function createApp(store) {
   function ballots(bench) {
     return store.all('ballot', bench.id);
   }
+  // 每位评审的揭晓互不影响：记录按 bench 存放，读取时再按会话过滤。
+  function reveals(bench, session) {
+    return store.all('reveal', bench.id).filter((r) => r.session === session);
+  }
+  function lockedScores(bench, session) {
+    return Object.assign({}, ...reveals(bench, session).map((r) => r.scores));
+  }
   function view(req, bench) {
     const ballotId = `${bench.id}:${req.session}`;
     let assignment = store.get('assignment', ballotId);
@@ -130,6 +144,20 @@ export function createApp(store) {
       store.put('assignment', assignment, bench.id);
     }
     const ballot = store.get('ballot', ballotId);
+    const myReveals = reveals(bench, req.session);
+    const revealedTasks = new Set(myReveals.map((r) => r.taskId));
+    if (ballot) bench.tasks.forEach((t) => revealedTasks.add(t.id));
+    const myScores = ballot
+      ? Object.fromEntries(
+          Object.entries(ballot.scores).map(([entryId, value]) => {
+            const entry = bench.entries.find((e) => e.id === entryId);
+            const task = entry && bench.tasks.find((t) => t.id === entry.taskId);
+            const max = task ? task.criteria.reduce((n, c) => n + c.maxScore, 0) : 0;
+            const folded = normalizeScore(value, max);
+            return [entryId, folded === null ? value : Math.round(folded * 10) / 10];
+          }),
+        )
+      : null;
     return {
       id: bench.id,
       title: bench.title,
@@ -137,33 +165,40 @@ export function createApp(store) {
       demo: bench.demo,
       status: bench.status,
       tasks: bench.tasks,
+      activeIndex: bench.activeIndex ?? 0,
       participantCount: bench.models.length,
       owner: bench.owner === req.session,
       sharePath:
         bench.owner === req.session && bench.shareToken ? `/play/${bench.shareToken}` : undefined,
       order: assignment.order,
       revealed: Boolean(ballot),
-      myBallot: ballot ? { scores: ballot.scores, comment: ballot.comment } : null,
+      revealedTasks: [...revealedTasks],
+      lockedScores: Object.assign({}, ...myReveals.map((r) => r.scores)),
+      myBallot: ballot ? { scores: myScores, comment: ballot.comment } : null,
       entries: bench.tasks
         .flatMap((t) =>
           assignment.order[t.id].map((entryId) => bench.entries.find((e) => e.id === entryId)),
         )
-        .map((e) => ({
-          id: e.id,
-          taskId: e.taskId,
-          status: e.status,
-          content: e.status === 'done' ? e.content : undefined,
-          html:
-            e.status === 'done' && bench.tasks.find((t) => t.id === e.taskId).format === 'html'
-              ? extractHtml(e.content)
-              : null,
-          truncated: e.truncated,
-          error: e.error,
-          outputChars: e.status === 'running' ? e.outputChars : undefined,
-          ...(ballot
-            ? { model: bench.models.find((m) => m.id === e.modelId), duration: e.duration }
-            : {}),
-        })),
+        .map((e) => {
+          const identity = revealedTasks.has(e.taskId)
+            ? bench.models.find((m) => m.id === e.modelId)
+            : null;
+          return {
+            id: e.id,
+            taskId: e.taskId,
+            status: e.status,
+            content: e.status === 'done' ? e.content : undefined,
+            html:
+              e.status === 'done' && bench.tasks.find((t) => t.id === e.taskId).format === 'html'
+                ? extractHtml(e.content)
+                : null,
+            truncated: e.truncated,
+            error: e.error,
+            outputChars: e.status === 'running' ? e.outputChars : undefined,
+            ...(identity ? { model: publicIdentity(identity) } : {}),
+            ...(ballot ? { duration: e.duration } : {}),
+          };
+        }),
       results: ballot ? totals(bench, ballots(bench)) : undefined,
       voterCount: ballot ? ballots(bench).length : undefined,
     };
@@ -258,6 +293,44 @@ export function createApp(store) {
     store.remove('model', req.params.id, req.session);
     res.json({ ok: true });
   });
+  async function runModelTest(config, key, source) {
+    try {
+      const result = await testConnection(config, key);
+      log('model.test', { source, protocol: config.protocol, ok: true, latency: result.latency });
+      return { ok: true, reply: result.reply, latency: result.latency };
+    } catch (err) {
+      const error = connectionError(err);
+      log('model.test', {
+        source,
+        protocol: config.protocol,
+        ok: false,
+        type: err.name,
+        reason: error,
+      });
+      return { ok: false, error };
+    }
+  }
+  // Tests the configuration currently in the form, before it is saved.
+  app.post('/api/models/test', async (req, res) => {
+    const data = testModelSchema.parse(req.body);
+    let key = data.key?.trim();
+    if (!key) {
+      const saved = data.id ? ownModel(req, data.id) : null;
+      if (!saved?.encryptedKey) return res.status(400).json({ error: '请填写 API Key' });
+      key = store.decrypt(saved.encryptedKey);
+    }
+    const { id: _id, key: _key, ...config } = data;
+    const result = await runModelTest(config, key, 'draft');
+    res.status(result.ok ? 200 : 502).json(result);
+  });
+  // Tests a saved configuration exactly as it is stored.
+  app.post('/api/models/:id/test', async (req, res) => {
+    const model = ownModel(req, req.params.id);
+    if (!model) return res.status(404).json({ error: '找不到模型配置' });
+    if (!model.encryptedKey) return res.status(400).json({ error: '该模型尚未保存 API Key' });
+    const result = await runModelTest(model, store.decrypt(model.encryptedKey), 'saved');
+    res.status(result.ok ? 200 : 502).json(result);
+  });
   app.get('/api/benches', (req, res) =>
     res.json(
       store
@@ -290,14 +363,45 @@ export function createApp(store) {
       status: 'running',
       tasks: data.tasks.map((t) => ({ ...t, id: id() })),
       models: models.map(publicModel),
+      activeIndex: 0,
     };
-    bench.entries = bench.tasks.flatMap((task) =>
-      models.map((m) => ({ id: id(), taskId: task.id, modelId: m.id, status: 'queued' })),
+    // Sequential testing: only the first task starts now; the rest wait for the reviewer.
+    bench.entries = bench.tasks.flatMap((task, ti) =>
+      models.map((m) => ({
+        id: id(),
+        taskId: task.id,
+        modelId: m.id,
+        status: ti === 0 ? 'queued' : 'pending',
+      })),
     );
     persistBench(bench);
     log('bench.created', { id: bench.id, tasks: bench.tasks.length, models: models.length });
     res.status(201).json({ id: bench.id });
-    bench.entries.forEach((e) => queue(bench.id, e.id));
+    bench.entries.filter((e) => e.status === 'queued').forEach((e) => queue(bench.id, e.id));
+  });
+  app.post('/api/benches/:id/next', (req, res) => {
+    const bench = access(req, req.params.id, false);
+    if (!bench) return res.status(404).json({ error: '找不到评测' });
+    if (bench.status === 'done' || ballots(bench).length)
+      return res.status(409).json({ error: '测试已结束，无法继续' });
+    const active = bench.activeIndex ?? 0;
+    if (active >= bench.tasks.length - 1)
+      return res.status(409).json({ error: '已经是最后一道题' });
+    const current = bench.entries.filter((e) => e.taskId === bench.tasks[active].id);
+    if (current.some((e) => ['pending', 'queued', 'running'].includes(e.status)))
+      return res.status(409).json({ error: '当前题目尚未完成，请先等待作答结束' });
+    bench.activeIndex = active + 1;
+    const nextId = bench.tasks[bench.activeIndex].id;
+    const nextEntries = bench.entries.filter((e) => e.taskId === nextId);
+    nextEntries.forEach((e) => {
+      e.status = 'queued';
+      delete e.error;
+      delete e.outputChars;
+    });
+    persistBench(bench);
+    log('bench.next', { id: bench.id, activeIndex: bench.activeIndex });
+    res.json({ ok: true });
+    nextEntries.forEach((e) => queue(bench.id, e.id));
   });
   app.post('/api/demo', (req, res) => {
     const task = { ...demoTask, id: id() };
@@ -356,6 +460,47 @@ export function createApp(store) {
       if (!bench) return res.status(404).json({ error: '评测不存在，或此浏览器没有访问权限' });
       res.json(view(req, bench));
     });
+    // 揭晓单题：先给该题打分，再单独查看它背后的模型；该题评分随即锁定。
+    app.post(`/api/${route}/:id/reveal`, (req, res) => {
+      const bench = access(req, req.params.id, shared);
+      if (!bench) return res.status(404).json({ error: '找不到评测' });
+      const ballotId = `${bench.id}:${req.session}`;
+      if (store.get('ballot', ballotId))
+        return res.status(409).json({ error: '本场评测已全部揭晓' });
+      const taskId = req.body?.taskId;
+      const index = bench.tasks.findIndex((t) => t.id === taskId);
+      if (index < 0) return res.status(400).json({ error: '题目不存在' });
+      const revealId = `${bench.id}:${req.session}:${taskId}`;
+      // 重复提交保持幂等，避免重复点击产生多余提示。
+      if (store.get('reveal', revealId)) return res.json(view(req, bench));
+      if (index > (bench.activeIndex ?? 0))
+        return res.status(409).json({ error: '这道题还没有开始' });
+      const entries = bench.entries.filter((e) => e.taskId === taskId);
+      if (entries.some((e) => ['pending', 'queued', 'running'].includes(e.status)))
+        return res.status(409).json({ error: '选手们还没有作答完成' });
+      const failed = entries.filter((e) => e.status === 'failed').length;
+      if (failed) return res.status(409).json({ error: `有 ${failed} 份成果未生成成功` });
+      let scores;
+      try {
+        scores = validateTaskScores(bench, taskId, req.body?.scores);
+      } catch (err) {
+        return res.status(400).json({ error: err.message });
+      }
+      store.put(
+        'reveal',
+        {
+          id: revealId,
+          benchId: bench.id,
+          session: req.session,
+          taskId,
+          scores,
+          createdAt: new Date().toISOString(),
+        },
+        bench.id,
+      );
+      log('task.revealed', { benchId: bench.id, taskId });
+      res.json(view(req, bench));
+    });
     app.post(`/api/${route}/:id/vote`, (req, res) => {
       const bench = access(req, req.params.id, shared);
       if (!bench) return res.status(404).json({ error: '找不到评测' });
@@ -368,7 +513,11 @@ export function createApp(store) {
         return res.status(400).json({ error: '请先打开匿名评审页面' });
       let scores;
       try {
-        scores = validateScores(bench, req.body.scores);
+        // 已经揭晓的题目分数以服务端锁定值为准，客户端无法改写。
+        scores = validateScores(bench, {
+          ...req.body.scores,
+          ...lockedScores(bench, req.session),
+        });
       } catch (err) {
         return res.status(400).json({ error: err.message });
       }
